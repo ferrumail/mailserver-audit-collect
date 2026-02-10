@@ -1,13 +1,21 @@
 # mailserver-audit-collect
-create a tar archive with data required to fill a audit report for Linux mailserver
 
-I will write more than one script, for example sendmail will have own one.
+Scripts to collect configuration data from Linux mail servers for security audit purposes.
 
- a. These scripts don't change anything on the server
- 
- b. These scripts read some system configuration files
- 
- c. These scripts can query running process about their current config
+Each MTA has its own dedicated script (Postfix, Dovecot, Sendmail, Exim).
 
- d. These scripts will write an archive with data collected
- 
+## Security guarantees
+
+All scripts are strictly read-only:
+
+- ✅ No modifications to system files or services
+- ✅ No network calls outside the server (`curl`, `wget`, `nc` are never used)
+- ✅ Only read operations via `cat`, `grep`, `awk`, and process inspection
+- ✅ Output is a local `.tar.gz` archive containing collected data only
+
+## Usage
+
+```bash
+sudo ./scripts/audit-postfix.sh
+# Output: mailserver-audit-<hostname>-<date>.tar.gz
+```
