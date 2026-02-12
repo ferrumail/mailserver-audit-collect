@@ -4,18 +4,32 @@
 # Raccolta configurazioni mailserver per audit
 # Supporta: Postfix, Exim (MTA) / Dovecot, Cyrus (MDA)
 #
-# Versione: 2.0
+# Versione: 2.2
 # Uso: sudo ./mailserver-audit-collect.sh
+#
+# Modifiche v2.2:
+# - Gestione log ruotati e compressi (.gz, .bz2, .xz)
+# - Funzione read_rotated_logs() per concatenare log in ordine cronologico
+# - Aumentato sample size (20→30 per top IP, 10→20 per eventi)
+# - Aggiunta distribuzione temporale attacchi per giorno
+#
+# Modifiche v2.1:
+# - Aggiunta verifica partizioni mail (/var/mail, /var/spool, ecc.)
+# - Aggiunta raccolta package info per valutazione CVE
+# - Aggiunto dovecot --build-options per CVE specifiche moduli
+# - Aggiunta sezione analisi log (statistiche eventi critici)
+# - Aggiunta raccolta top IP per auth failure
 #
 # Modifiche v2.0:
 # - Aggiunto doveconf -P (password nascoste) e -N (include plugin)
 # - Aggiunta raccolta regole firewall (iptables, nftables, firewalld)
 # - Aggiunta raccolta timestamp per verifica coerenza config vs servizio
+# - Rimossa sezione diff (eseguire lato auditor)
 #
 
 set -u
 
-SCRIPT_VERSION="2.0"
+SCRIPT_VERSION="2.2"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 HOSTNAME=$(hostname -f 2>/dev/null || hostname)
 OUTDIR="mailaudit_${HOSTNAME}_${TIMESTAMP}"
@@ -39,6 +53,74 @@ fi
 log_info()  { echo -e "${C_GREEN}[INFO]${C_RESET} $1"; }
 log_warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET} $1"; }
 log_error() { echo -e "${C_RED}[ERROR]${C_RESET} $1"; }
+
+# Funzione per leggere log ruotati (compressi e non)
+# Uso: read_rotated_logs /var/log/maillog | grep 'pattern'
+# Gestisce: .gz, .bz2, .xz e file non compressi
+# Ordine: dal più vecchio al più recente
+read_rotated_logs() {
+    local base="$1"
+    local max_files="${2:-10}"  # Default: ultimi 10 file (incluso attivo)
+    local files_found=""
+    
+    # Trova tutti i file correlati
+    # Pattern: base, base.0, base.1, base.N, base.N.gz, base.N.bz2, base.N.xz
+    for f in "${base}".[0-9]* "${base}".[0-9]*.gz "${base}".[0-9]*.bz2 "${base}".[0-9]*.xz \
+             "${base}"-[0-9]* "${base}"-[0-9]*.gz "${base}"-[0-9]*.bz2 "${base}"-[0-9]*.xz; do
+        [ -f "$f" ] && files_found="$files_found $f"
+    done
+    
+    # Aggiungi file base se esiste
+    [ -f "$base" ] && files_found="$files_found $base"
+    
+    # Ordina per data modifica (più vecchio prima) e limita
+    # shellcheck disable=SC2086
+    local sorted_files
+    sorted_files=$(ls -1t $files_found 2>/dev/null | tail -n "$max_files" | tac)
+    
+    # Leggi ogni file con il tool appropriato
+    for f in $sorted_files; do
+        case "$f" in
+            *.gz)
+                if command -v zcat >/dev/null 2>&1; then
+                    zcat "$f" 2>/dev/null
+                elif command -v gzip >/dev/null 2>&1; then
+                    gzip -dc "$f" 2>/dev/null
+                fi
+                ;;
+            *.bz2)
+                if command -v bzcat >/dev/null 2>&1; then
+                    bzcat "$f" 2>/dev/null
+                elif command -v bzip2 >/dev/null 2>&1; then
+                    bzip2 -dc "$f" 2>/dev/null
+                fi
+                ;;
+            *.xz)
+                if command -v xzcat >/dev/null 2>&1; then
+                    xzcat "$f" 2>/dev/null
+                elif command -v xz >/dev/null 2>&1; then
+                    xz -dc "$f" 2>/dev/null
+                fi
+                ;;
+            *)
+                cat "$f" 2>/dev/null
+                ;;
+        esac
+    done
+}
+
+# Funzione per trovare il file base del log mail
+find_mail_log_base() {
+    for logbase in /var/log/mail.log /var/log/maillog /var/log/mail/mail.log; do
+        # Verifica se esiste il file base O file ruotati
+        if [ -f "$logbase" ] || ls "${logbase}".[0-9]* >/dev/null 2>&1 || \
+           ls "${logbase}"-[0-9]* >/dev/null 2>&1; then
+            echo "$logbase"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # Verifica root
 if [ "$(id -u)" -ne 0 ]; then
@@ -148,6 +230,32 @@ if [ "$MTA_FOUND" = "postfix" ]; then
     # Versione
     collect_cmd "Postfix versione" "postfix/version.txt" postconf mail_version
     
+    # Pacchetto installato (per verificare backport security)
+    {
+        echo "# Informazioni pacchetto Postfix per valutazione CVE"
+        echo "# Data: $(date -Is)"
+        echo "# ---"
+        echo ""
+        
+        # Debian/Ubuntu
+        if command -v dpkg >/dev/null 2>&1; then
+            echo "## dpkg info"
+            dpkg -l | grep -i postfix 2>/dev/null
+            echo ""
+            echo "## apt policy"
+            apt-cache policy postfix 2>/dev/null
+        fi
+        
+        # RHEL/CentOS/Fedora
+        if command -v rpm >/dev/null 2>&1; then
+            echo "## rpm info"
+            rpm -qa | grep -i postfix 2>/dev/null
+            echo ""
+            echo "## rpm details"
+            rpm -qi postfix 2>/dev/null
+        fi
+    } > "$OUTDIR/postfix/package_info.txt"
+    
     # File di configurazione
     for f in /etc/postfix/main.cf \
              /etc/postfix/master.cf \
@@ -213,6 +321,32 @@ if [ "$MTA_FOUND" = "exim" ]; then
     # Versione e build
     collect_cmd "Exim versione" "exim/version.txt" "$EXIM_CMD -bV"
     
+    # Pacchetto installato (per verificare backport security)
+    {
+        echo "# Informazioni pacchetto Exim per valutazione CVE"
+        echo "# Data: $(date -Is)"
+        echo "# ---"
+        echo ""
+        
+        # Debian/Ubuntu
+        if command -v dpkg >/dev/null 2>&1; then
+            echo "## dpkg info"
+            dpkg -l | grep -i exim 2>/dev/null
+            echo ""
+            echo "## apt policy"
+            apt-cache policy exim4-daemon-heavy 2>/dev/null || apt-cache policy exim4-daemon-light 2>/dev/null
+        fi
+        
+        # RHEL/CentOS/Fedora
+        if command -v rpm >/dev/null 2>&1; then
+            echo "## rpm info"
+            rpm -qa | grep -i exim 2>/dev/null
+            echo ""
+            echo "## rpm details"
+            rpm -qi exim 2>/dev/null
+        fi
+    } > "$OUTDIR/exim/package_info.txt"
+    
     # File di configurazione - varia per distribuzione
     # Debian/Ubuntu: /etc/exim4/
     # RHEL/CentOS: /etc/exim/
@@ -258,8 +392,37 @@ if [ "$MDA_FOUND" = "dovecot" ]; then
     mkdir -p "$OUTDIR/dovecot/config_files"
     mkdir -p "$OUTDIR/dovecot/config_active"
     
-    # Versione
+    # Versione e build info per valutazione CVE
     collect_cmd "Dovecot versione" "dovecot/version.txt" dovecot --version
+    
+    # Build options - importante per CVE (alcuni sono specifici per moduli)
+    collect_cmd "Dovecot build options" "dovecot/build_options.txt" dovecot --build-options
+    
+    # Pacchetto installato (per verificare backport security)
+    {
+        echo "# Informazioni pacchetto Dovecot per valutazione CVE"
+        echo "# Data: $(date -Is)"
+        echo "# ---"
+        echo ""
+        
+        # Debian/Ubuntu
+        if command -v dpkg >/dev/null 2>&1; then
+            echo "## dpkg info"
+            dpkg -l | grep -i dovecot 2>/dev/null
+            echo ""
+            echo "## apt policy"
+            apt-cache policy dovecot-core 2>/dev/null
+        fi
+        
+        # RHEL/CentOS/Fedora
+        if command -v rpm >/dev/null 2>&1; then
+            echo "## rpm info"
+            rpm -qa | grep -i dovecot 2>/dev/null
+            echo ""
+            echo "## rpm details"
+            rpm -qi dovecot 2>/dev/null || rpm -qi dovecot-core 2>/dev/null
+        fi
+    } > "$OUTDIR/dovecot/package_info.txt"
     
     # File di configurazione
     for confdir in /etc/dovecot; do
@@ -593,6 +756,97 @@ if [ ! -s "$OUTDIR/system/listening_ports.txt" ] && command -v netstat >/dev/nul
 fi
 
 #############################################
+# PARTIZIONI E STORAGE MAIL
+#############################################
+
+log_info "=== Verifica partizioni mail ==="
+
+{
+    echo "# Analisi partizioni per directory mail-critical"
+    echo "# Data: $(date -Is)"
+    echo "#"
+    echo "# NOTA AUDIT: directory mail su partizione separata da root = buona pratica"
+    echo "#             Protegge da DoS via riempimento disco"
+    echo "# ---"
+    echo ""
+    
+    # Identifica root device
+    ROOT_DEV=$(df / 2>/dev/null | tail -1 | awk '{print $1}')
+    echo "root_device: $ROOT_DEV"
+    echo "root_mountpoint: /"
+    echo ""
+    
+    # Directory mail-related da verificare
+    MAIL_DIRS="/var/mail /var/vmail /var/spool/mail /var/spool/postfix /var/spool/exim /var/spool/exim4 /var/spool/cyrus /var/lib/dovecot /var/lib/cyrus"
+    
+    echo "## Verifica separazione partizioni"
+    echo ""
+    
+    for dir in $MAIL_DIRS; do
+        if [ -d "$dir" ]; then
+            # Trova device e mountpoint per questa directory
+            dir_info=$(df "$dir" 2>/dev/null | tail -1)
+            dir_dev=$(echo "$dir_info" | awk '{print $1}')
+            dir_mount=$(echo "$dir_info" | awk '{print $6}')
+            dir_size=$(echo "$dir_info" | awk '{print $2}')
+            dir_used=$(echo "$dir_info" | awk '{print $3}')
+            dir_avail=$(echo "$dir_info" | awk '{print $4}')
+            dir_pct=$(echo "$dir_info" | awk '{print $5}')
+            
+            # Verifica se è su partizione diversa da root
+            if [ "$dir_dev" = "$ROOT_DEV" ]; then
+                separation="NO (stessa partizione di root)"
+            else
+                separation="SI (partizione dedicata: $dir_mount)"
+            fi
+            
+            echo "directory: $dir"
+            echo "  device: $dir_dev"
+            echo "  mountpoint: $dir_mount"
+            echo "  separated_from_root: $separation"
+            echo "  size_kb: $dir_size"
+            echo "  used_kb: $dir_used"
+            echo "  available_kb: $dir_avail"
+            echo "  used_percent: $dir_pct"
+            
+            # Dimensione contenuto directory
+            dir_du=$(du -sk "$dir" 2>/dev/null | awk '{print $1}')
+            echo "  content_size_kb: $dir_du"
+            echo ""
+        fi
+    done
+    
+    echo ""
+    echo "## Riepilogo mount points rilevanti"
+    echo ""
+    df -h 2>/dev/null | grep -E '(/var/mail|/var/vmail|/var/spool|/home|/$)' | head -20
+    
+    echo ""
+    echo "## Mount options (per verifica noexec, nosuid su mail dirs)"
+    echo ""
+    mount | grep -E '(/var/mail|/var/vmail|/var/spool|/home| / )' 2>/dev/null
+    
+    echo ""
+    echo "## Quota filesystem (se attive)"
+    echo ""
+    if command -v repquota >/dev/null 2>&1; then
+        repquota -a 2>/dev/null | head -30 || echo "# repquota non disponibile o nessuna quota attiva"
+    else
+        echo "# repquota non installato"
+    fi
+    
+    # Verifica quota Dovecot (se configurato)
+    if [ "$MDA_FOUND" = "dovecot" ]; then
+        echo ""
+        echo "## Dovecot quota plugin config"
+        doveconf -n 2>/dev/null | grep -i quota || echo "# Nessuna configurazione quota in Dovecot"
+    fi
+    
+} > "$OUTDIR/system/partitions_mail.txt"
+
+log_info "Analisi partizioni completata"
+
+#############################################
 # TIMESTAMP PER ANALISI COERENZA
 #############################################
 
@@ -745,6 +999,274 @@ mkdir -p "$OUTDIR/timestamps"
 } > "$OUTDIR/timestamps/service_vs_config.txt"
 
 log_info "Timestamp servizi raccolti"
+
+#############################################
+# ANALISI LOG - STATISTICHE EVENTI CRITICI
+#############################################
+
+log_info "=== Analisi log eventi critici ==="
+
+mkdir -p "$OUTDIR/logs"
+
+# Trova base path dei log
+MAIL_LOG_BASE=$(find_mail_log_base)
+
+AUTH_LOG_BASE=""
+for logbase in /var/log/auth.log /var/log/secure /var/log/auth/auth.log; do
+    if [ -f "$logbase" ] || ls "${logbase}".[0-9]* >/dev/null 2>&1; then
+        AUTH_LOG_BASE="$logbase"
+        break
+    fi
+done
+
+DOVECOT_LOG_BASE=""
+for logbase in /var/log/dovecot.log /var/log/dovecot/dovecot.log; do
+    if [ -f "$logbase" ] || ls "${logbase}".[0-9]* >/dev/null 2>&1; then
+        DOVECOT_LOG_BASE="$logbase"
+        break
+    fi
+done
+
+# Parametro: quanti file ruotati processare (default 10 = circa 10-30 giorni tipicamente)
+LOG_ROTATION_DEPTH=10
+
+{
+    echo "# Statistiche eventi critici dai log"
+    echo "# Data analisi: $(date -Is)"
+    echo "# Profondità rotazione: ultimi $LOG_ROTATION_DEPTH file (compressi inclusi)"
+    echo "#"
+    echo "# NOTA: Processa log ruotati (.gz, .bz2, .xz) in ordine cronologico"
+    echo "# ---"
+    echo ""
+    
+    if [ -n "$MAIL_LOG_BASE" ]; then
+        echo "## Mail log base: $MAIL_LOG_BASE"
+        
+        # Elenca file trovati
+        echo "### File processati:"
+        for f in "${MAIL_LOG_BASE}".[0-9]* "${MAIL_LOG_BASE}".[0-9]*.gz \
+                 "${MAIL_LOG_BASE}".[0-9]*.bz2 "${MAIL_LOG_BASE}".[0-9]*.xz \
+                 "${MAIL_LOG_BASE}"-[0-9]* "${MAIL_LOG_BASE}"-[0-9]*.gz \
+                 "${MAIL_LOG_BASE}"-[0-9]*.bz2 "${MAIL_LOG_BASE}"-[0-9]*.xz \
+                 "${MAIL_LOG_BASE}"; do
+            [ -f "$f" ] && ls -lh "$f" 2>/dev/null | awk '{print "  " $9 " (" $5 ")"}'
+        done
+        echo ""
+        
+        # Conta righe totali processate
+        total_lines=$(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | wc -l)
+        echo "total_lines_processed: $total_lines"
+        echo ""
+        
+        # Postfix events
+        if [ "$MTA_FOUND" = "postfix" ]; then
+            echo "### Postfix eventi"
+            echo ""
+            
+            echo "reject_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'reject:' 2>/dev/null || echo 0)"
+            echo "warning_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'warning:' 2>/dev/null || echo 0)"
+            echo "error_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'error:' 2>/dev/null || echo 0)"
+            echo "fatal_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'fatal:' 2>/dev/null || echo 0)"
+            echo "timeout_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -ci 'timeout' 2>/dev/null || echo 0)"
+            echo "relay_denied_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'Relay access denied' 2>/dev/null || echo 0)"
+            echo "sasl_auth_failed_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'SASL.*authentication failed' 2>/dev/null || echo 0)"
+            echo "tls_error_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -ci 'tls.*error\|ssl.*error' 2>/dev/null || echo 0)"
+            echo ""
+            
+            echo "### Ultimi 20 reject (sample)"
+            read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep 'reject:' | tail -20 | sed 's/^/  /'
+            echo ""
+            
+            echo "### Ultimi 20 SASL auth failed (sample)"
+            read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep 'SASL.*authentication failed' | tail -20 | sed 's/^/  /'
+            echo ""
+        fi
+        
+        # Exim events
+        if [ "$MTA_FOUND" = "exim" ]; then
+            echo "### Exim eventi"
+            echo ""
+            
+            echo "rejected_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'rejected' 2>/dev/null || echo 0)"
+            echo "refused_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'refused' 2>/dev/null || echo 0)"
+            echo "error_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -ci 'error' 2>/dev/null || echo 0)"
+            echo "timeout_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -ci 'timeout' 2>/dev/null || echo 0)"
+            echo "auth_failed_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'authenticator failed' 2>/dev/null || echo 0)"
+            echo "tls_error_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -ci 'tls.*error\|ssl.*error' 2>/dev/null || echo 0)"
+            echo ""
+            
+            echo "### Ultimi 20 rejected (sample)"
+            read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -i 'rejected\|refused' | tail -20 | sed 's/^/  /'
+            echo ""
+        fi
+        
+        # Dovecot events (spesso nello stesso log)
+        if [ "$MDA_FOUND" = "dovecot" ]; then
+            echo "### Dovecot eventi (da mail.log)"
+            echo ""
+            
+            echo "auth_failed_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'dovecot.*auth failed\|dovecot.*authentication failure' 2>/dev/null || echo 0)"
+            echo "login_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'dovecot.*Login' 2>/dev/null || echo 0)"
+            echo "disconnect_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'dovecot.*Disconnected' 2>/dev/null || echo 0)"
+            echo "error_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'dovecot.*Error\|dovecot.*error' 2>/dev/null || echo 0)"
+            echo "warning_count: $(read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'dovecot.*Warning\|dovecot.*warning' 2>/dev/null || echo 0)"
+            echo ""
+        fi
+    else
+        echo "## Mail log: NON TROVATO"
+        echo "# Cercati: /var/log/mail.log, /var/log/maillog, /var/log/mail/mail.log"
+        echo "# (inclusi file ruotati .N, .N.gz, .N.bz2, .N.xz)"
+        echo ""
+    fi
+    
+    # Dovecot log separato (alcune configurazioni)
+    if [ -n "$DOVECOT_LOG_BASE" ] && [ "$MDA_FOUND" = "dovecot" ]; then
+        echo "## Dovecot log dedicato: $DOVECOT_LOG_BASE"
+        
+        # Elenca file
+        echo "### File processati:"
+        for f in "${DOVECOT_LOG_BASE}".[0-9]* "${DOVECOT_LOG_BASE}".[0-9]*.gz \
+                 "${DOVECOT_LOG_BASE}".[0-9]*.bz2 "${DOVECOT_LOG_BASE}".[0-9]*.xz \
+                 "${DOVECOT_LOG_BASE}"; do
+            [ -f "$f" ] && ls -lh "$f" 2>/dev/null | awk '{print "  " $9 " (" $5 ")"}'
+        done
+        echo ""
+        
+        echo "auth_failed_count: $(read_rotated_logs "$DOVECOT_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -ci 'auth failed\|authentication failure' 2>/dev/null || echo 0)"
+        echo "login_count: $(read_rotated_logs "$DOVECOT_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'Login' 2>/dev/null || echo 0)"
+        echo "error_count: $(read_rotated_logs "$DOVECOT_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -ci 'error' 2>/dev/null || echo 0)"
+        echo "warning_count: $(read_rotated_logs "$DOVECOT_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -ci 'warning' 2>/dev/null || echo 0)"
+        echo ""
+        
+        echo "### Ultimi 20 auth failed (sample)"
+        read_rotated_logs "$DOVECOT_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -i 'auth failed\|authentication failure' | tail -20 | sed 's/^/  /'
+        echo ""
+        
+        echo "### Ultimi 20 errori (sample)"
+        read_rotated_logs "$DOVECOT_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -i 'error' | tail -20 | sed 's/^/  /'
+        echo ""
+    fi
+    
+    # Auth log per tentativi brute force
+    if [ -n "$AUTH_LOG_BASE" ]; then
+        echo "## Auth log: $AUTH_LOG_BASE"
+        echo ""
+        
+        # Fail2ban bans (se presente)
+        if command -v fail2ban-client >/dev/null 2>&1; then
+            echo "### Fail2ban bans"
+            echo "ban_count: $(read_rotated_logs "$AUTH_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'fail2ban.*Ban' 2>/dev/null || echo 0)"
+            echo "unban_count: $(read_rotated_logs "$AUTH_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep -c 'fail2ban.*Unban' 2>/dev/null || echo 0)"
+            echo ""
+            
+            echo "### Ultimi 20 ban (sample)"
+            read_rotated_logs "$AUTH_LOG_BASE" "$LOG_ROTATION_DEPTH" | grep 'fail2ban.*Ban' | tail -20 | sed 's/^/  /'
+            echo ""
+        fi
+    fi
+    
+    # Statistiche journalctl se disponibile (sistemi con systemd)
+    if command -v journalctl >/dev/null 2>&1; then
+        echo "## Statistiche journalctl (ultima settimana)"
+        echo ""
+        
+        if [ "$MTA_FOUND" = "postfix" ]; then
+            echo "### Postfix via journalctl"
+            echo "total_entries: $(journalctl -u postfix --since '1 week ago' 2>/dev/null | wc -l)"
+            echo "error_entries: $(journalctl -u postfix --since '1 week ago' -p err 2>/dev/null | wc -l)"
+            echo "warning_entries: $(journalctl -u postfix --since '1 week ago' -p warning 2>/dev/null | wc -l)"
+            echo ""
+        fi
+        
+        if [ "$MDA_FOUND" = "dovecot" ]; then
+            echo "### Dovecot via journalctl"
+            echo "total_entries: $(journalctl -u dovecot --since '1 week ago' 2>/dev/null | wc -l)"
+            echo "error_entries: $(journalctl -u dovecot --since '1 week ago' -p err 2>/dev/null | wc -l)"
+            echo "warning_entries: $(journalctl -u dovecot --since '1 week ago' -p warning 2>/dev/null | wc -l)"
+            echo ""
+        fi
+        
+        if command -v fail2ban-client >/dev/null 2>&1; then
+            echo "### Fail2ban via journalctl"
+            echo "total_entries: $(journalctl -u fail2ban --since '1 week ago' 2>/dev/null | wc -l)"
+            echo "ban_entries: $(journalctl -u fail2ban --since '1 week ago' 2>/dev/null | grep -c 'Ban')"
+            echo ""
+        fi
+    fi
+    
+} > "$OUTDIR/logs/critical_events_stats.txt"
+
+log_info "Statistiche log raccolte"
+
+# Top IP per auth failure (utile per identificare attacchi)
+{
+    echo "# Top IP per autenticazioni fallite"
+    echo "# Data: $(date -Is)"
+    echo "# Profondità: ultimi $LOG_ROTATION_DEPTH file log (compressi inclusi)"
+    echo "# ---"
+    echo ""
+    
+    if [ -n "$MAIL_LOG_BASE" ]; then
+        echo "## Da mail log ($MAIL_LOG_BASE + ruotati)"
+        echo ""
+        
+        # Postfix SASL failures
+        if [ "$MTA_FOUND" = "postfix" ]; then
+            echo "### Top 30 IP - SASL auth failed"
+            read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | \
+                grep 'SASL.*authentication failed' | \
+                grep -oE '\[([0-9]{1,3}\.){3}[0-9]{1,3}\]' | \
+                tr -d '[]' | sort | uniq -c | sort -rn | head -30
+            echo ""
+        fi
+        
+        # Exim auth failures
+        if [ "$MTA_FOUND" = "exim" ]; then
+            echo "### Top 30 IP - Exim auth failed"
+            read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | \
+                grep -i 'authenticator failed\|AUTH.*failed' | \
+                grep -oE '\[([0-9]{1,3}\.){3}[0-9]{1,3}\]' | \
+                tr -d '[]' | sort | uniq -c | sort -rn | head -30
+            echo ""
+        fi
+        
+        # Dovecot auth failures (da mail log)
+        if [ "$MDA_FOUND" = "dovecot" ]; then
+            echo "### Top 30 IP - Dovecot auth failed"
+            read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | \
+                grep -i 'dovecot.*auth failed\|dovecot.*authentication failure' | \
+                grep -oE 'rip=([0-9]{1,3}\.){3}[0-9]{1,3}' | \
+                cut -d= -f2 | sort | uniq -c | sort -rn | head -30
+            echo ""
+        fi
+    fi
+    
+    # Dovecot log dedicato
+    if [ -n "$DOVECOT_LOG_BASE" ] && [ "$MDA_FOUND" = "dovecot" ]; then
+        echo "## Da Dovecot log dedicato ($DOVECOT_LOG_BASE + ruotati)"
+        echo "### Top 30 IP - auth failed"
+        read_rotated_logs "$DOVECOT_LOG_BASE" "$LOG_ROTATION_DEPTH" | \
+            grep -i 'auth failed\|authentication failure' | \
+            grep -oE 'rip=([0-9]{1,3}\.){3}[0-9]{1,3}' | \
+            cut -d= -f2 | sort | uniq -c | sort -rn | head -30
+        echo ""
+    fi
+    
+    # Distribuzione temporale attacchi (per giorno)
+    echo "## Distribuzione auth failure per giorno"
+    echo ""
+    
+    if [ -n "$MAIL_LOG_BASE" ]; then
+        echo "### Da mail log"
+        read_rotated_logs "$MAIL_LOG_BASE" "$LOG_ROTATION_DEPTH" | \
+            grep -iE 'auth.*fail|authentication failure|SASL.*failed' | \
+            grep -oE '^[A-Za-z]{3} [ 0-9]{2}' | sort | uniq -c | tail -30
+        echo ""
+    fi
+    
+} > "$OUTDIR/logs/top_failed_auth_ips.txt"
+
+log_info "Top IP auth failure raccolti"
 
 #############################################
 # FINALIZZAZIONE
