@@ -526,6 +526,7 @@ if command -v fail2ban-client >/dev/null 2>&1; then
     
     # File config
     for f in /etc/fail2ban/fail2ban.conf \
+             /etc/fail2ban/fail2ban.local \
              /etc/fail2ban/jail.conf \
              /etc/fail2ban/jail.local \
              /etc/fail2ban/jail.d/*.conf \
